@@ -15,13 +15,40 @@ const DAY_SHORT = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 const TVDB_IMG = "https://artworks.thetvdb.com";
 
 function epKey(s, e) { return `${s}-${e}`; }
+const TODAY = () => { const d = new Date(); d.setHours(23,59,59,999); return d; };
+function isAired(ep) {
+  if (!ep.aired) return true; // no date stored = old data, treat as aired for backward compat
+  return new Date(ep.aired) <= TODAY();
+}
 function getNextEpisode(show) {
   if (!show.seasons) return null;
   for (const season of show.seasons)
     for (const ep of season.episodes)
-      if (!show.watched?.[epKey(season.number, ep.n)])
+      if (isAired(ep) && !show.watched?.[epKey(season.number, ep.n)])
         return { season: season.number, episode: ep.n, title: ep.title };
   return null;
+}
+function getNextUnaired(show) {
+  if (!show.seasons) return null;
+  const today = TODAY();
+  for (const season of show.seasons)
+    for (const ep of season.episodes)
+      if (ep.aired && new Date(ep.aired) > today)
+        return { season: season.number, episode: ep.n, title: ep.title, aired: ep.aired };
+  return null;
+}
+function hasUpcomingEpisode(show) {
+  const today = TODAY();
+  const in30 = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+  return (show.seasons || []).some(s => s.episodes.some(ep => {
+    if (!ep.aired) return false;
+    const d = new Date(ep.aired);
+    return d > today && d <= in30;
+  }));
+}
+function showOnCalendar(show) {
+  if (getNextEpisode(show) !== null) return true; // has unwatched aired episodes
+  return hasUpcomingEpisode(show);                // or a new ep airing soon
 }
 function getTotalEpisodes(show) { return show.seasons?.reduce((a, s) => a + s.episodes.length, 0) ?? 0; }
 function getWatchedCount(show) { return Object.values(show.watched || {}).filter(Boolean).length; }
@@ -108,7 +135,7 @@ async function fetchShowById(tvdbId) {
     const sNum = ep.seasonNumber;
     if (sNum === 0) continue;
     if (!seasonMap[sNum]) seasonMap[sNum] = [];
-    seasonMap[sNum].push({ n: ep.number, title: ep.name || `Episode ${ep.number}` });
+    seasonMap[sNum].push({ n: ep.number, title: ep.name || `Episode ${ep.number}`, aired: ep.aired || null });
   }
   const seasons = Object.keys(seasonMap).map(Number).sort((a,b) => a-b)
     .map(num => ({ number:num, episodes:seasonMap[num].sort((a,b) => a.n-b.n) }));
@@ -284,7 +311,7 @@ function AuthScreen({ onAuth }) {
 
 // ── Settings Panel ────────────────────────────────────────────────────────────
 
-function SettingsPanel({ session, profile, onProfileUpdate, onClose }) {
+function SettingsPanel({ session, profile, onProfileUpdate, onClose, shows, onRefreshAll }) {
   const [displayName, setDisplayName] = useState(profile?.display_name || "");
   const [shareCode, setShareCode] = useState("");
   const [following, setFollowing] = useState([]);
@@ -293,6 +320,8 @@ function SettingsPanel({ session, profile, onProfileUpdate, onClose }) {
   const [joinError, setJoinError] = useState("");
   const [copied, setCopied] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshMsg, setRefreshMsg] = useState("");
 
   useEffect(() => { loadSettings(); }, []);
 
@@ -333,6 +362,16 @@ function SettingsPanel({ session, profile, onProfileUpdate, onClose }) {
   function copyShareLink() {
     navigator.clipboard.writeText(`${window.location.origin}?code=${profile?.share_code}`);
     setCopied(true); setTimeout(() => setCopied(false), 2000);
+  }
+
+  async function handleRefreshAll() {
+    setRefreshing(true); setRefreshMsg("");
+    try {
+      await onRefreshAll(shows);
+      setRefreshMsg(`Refreshed ${shows.length} show${shows.length!==1?"s":""}!`);
+      setTimeout(() => setRefreshMsg(""), 4000);
+    } catch(e) { setRefreshMsg("Some shows failed to refresh."); }
+    setRefreshing(false);
   }
 
   const card = (extra = {}) => ({ background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:10, ...extra });
@@ -382,6 +421,15 @@ function SettingsPanel({ session, profile, onProfileUpdate, onClose }) {
             </div>
           </div>
         )}
+        <div style={{ ...card({ padding:"18px 20px" }) }}>
+          <div style={{ fontSize:11, fontWeight:700, color:"#4a4a6a", letterSpacing:"1px", textTransform:"uppercase", marginBottom:8 }}>Refresh Show Data</div>
+          <div style={{ fontSize:13, color:"#6a6a8a", marginBottom:12, lineHeight:1.6 }}>Re-fetch all your shows from TVDB to update episode air dates, posters, and schedules. Your watch progress is never affected.</div>
+          <button onClick={handleRefreshAll} disabled={refreshing || !shows?.length}
+            style={{ background:refreshing?"#181830":"rgba(128,128,255,0.12)", border:"1px solid rgba(128,128,255,0.25)", color:refreshing?"#4a4a6a":"#8080ff", borderRadius:8, padding:"10px 18px", fontSize:13, fontWeight:600, width:"100%" }}>
+            {refreshing ? <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><LoadingDots color="#6060c0"/> Refreshing all shows...</span> : `Refresh All ${shows?.length || 0} Shows`}
+          </button>
+          {refreshMsg && <div style={{ marginTop:10, fontSize:13, color:"#80d080", textAlign:"center" }}>{refreshMsg}</div>}
+        </div>
       </div>
     </div>
   );
@@ -435,6 +483,36 @@ export default function TVTracker() {
     setProfile(data);
   }
 
+  async function refreshShowData(showId, tvdbId, existingPoster) {
+    try {
+      const fresh = await fetchShowById(tvdbId);
+      await supabase.from("shows").update({
+        seasons: fresh.seasons,
+        poster: fresh.poster || existingPoster || null,
+        air_day: fresh.airDay,
+        time: fresh.time,
+        platform: fresh.platform,
+      }).eq("id", showId);
+      const updater = prev => prev.map(s => s.id !== showId ? s : {
+        ...s, seasons: fresh.seasons,
+        poster: fresh.poster || s.poster,
+        airDay: fresh.airDay, time: fresh.time, platform: fresh.platform,
+      });
+      setShows(updater);
+      setSelectedShow(prev => prev?.id === showId ? { ...prev, seasons: fresh.seasons, poster: fresh.poster || prev.poster, airDay: fresh.airDay, time: fresh.time } : prev);
+    } catch(e) { console.warn("Backfill failed for show", showId, e); }
+  }
+
+  async function refreshAllShows(showList) {
+    for (const show of showList) {
+      if (show.tvdb_id) await refreshShowData(show.id, show.tvdb_id, show.poster);
+    }
+  }
+
+  function isShowStale(show) {
+    return (show.seasons || []).some(s => s.episodes.some(ep => !('aired' in ep)));
+  }
+
   async function loadShows() {
     setLoadingShows(true);
     try {
@@ -453,6 +531,13 @@ export default function TVTracker() {
       }));
       setShows(myShows);
       setColorIndex(myShows.length % SHOW_COLORS.length);
+
+      // Silently backfill any shows missing aired dates (old data)
+      const staleShows = myShows.filter(isShowStale);
+      if (staleShows.length) {
+        // Run in background, don't await
+        (async () => { for (const s of staleShows) await refreshShowData(s.id, s.tvdb_id, s.poster); })();
+      }
 
       const { data: follows } = await supabase.from("show_followers").select("following_id").eq("follower_id", session.user.id);
       if (follows?.length) {
@@ -619,7 +704,7 @@ export default function TVTracker() {
   }
 
   const allVisibleShows = showFollowed ? [...shows, ...followedShows] : shows;
-  function showsForDay(day) { return allVisibleShows.filter(s => s.airDay === day); }
+  function showsForDay(day) { return allVisibleShows.filter(s => s.airDay === day && showOnCalendar(s)); }
   function upNextShows() {
     return allVisibleShows.map(s => ({ show:s, next:getNextEpisode(s) })).filter(x => x.next !== null)
       .sort((a,b) => { const ai=DAYS.indexOf(a.show.airDay), bi=DAYS.indexOf(b.show.airDay); return (ai===-1?99:ai)-(bi===-1?99:bi); });
@@ -683,7 +768,7 @@ export default function TVTracker() {
         {loadingShows && <div style={{ display:"flex", justifyContent:"center", padding:"60px 0" }}><LoadingDots/></div>}
         {!loadingShows && (
           <>
-            {showSettings && <SettingsPanel session={session} profile={profile} onProfileUpdate={setProfile} onClose={() => { setShowSettings(false); setActiveTab("calendar"); }}/>}
+            {showSettings && <SettingsPanel session={session} profile={profile} onProfileUpdate={setProfile} onClose={() => { setShowSettings(false); setActiveTab("calendar"); }} shows={shows} onRefreshAll={refreshAllShows}/>}
 
             {/* SHOW DETAIL */}
             {!showSettings && selectedShow && (
@@ -767,13 +852,16 @@ export default function TVTracker() {
                               const watched = !!selectedShow.watched?.[key];
                               const nx = getNextEpisode(selectedShow);
                               const isNext = nx && nx.season===season.number && nx.episode===ep.n;
+                              const epAired = isAired(ep);
                               return (
                                 <div key={ep.n} className="ep-row" onClick={() => toggleEpisode(selectedShow.id,season.number,ep.n)}
-                                  style={{ display:"flex",alignItems:"center",gap:12,padding:"9px 16px 9px 42px",borderBottom:"1px solid rgba(255,255,255,0.025)",cursor:"pointer",background:isNext?`${selectedShow.color}10`:"transparent" }}>
+                                  style={{ display:"flex",alignItems:"center",gap:12,padding:"9px 16px 9px 42px",borderBottom:"1px solid rgba(255,255,255,0.025)",cursor:"pointer",background:isNext?`${selectedShow.color}10`:!epAired?"rgba(255,255,255,0.01)":"transparent",opacity:epAired?1:0.6 }}>
                                   <div style={{ width:17,height:17,borderRadius:4,flexShrink:0,border:watched?"none":"2px solid rgba(255,255,255,0.14)",background:watched?selectedShow.color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"#000",fontWeight:700,transition:"all .15s" }}>{watched?"✓":""}</div>
                                   <span style={{ fontSize:11,color:"#3a3a5a",minWidth:30,fontWeight:500 }}>E{ep.n}</span>
-                                  <span style={{ fontSize:13,flex:1,color:watched?"#3a3a5a":"#c8c8e0",textDecoration:watched?"line-through":"none",textDecorationColor:"#2a2a4a" }}>{ep.title}</span>
-                                  {isNext && <span style={{ fontSize:10,fontWeight:700,letterSpacing:"0.8px",color:selectedShow.color,background:`${selectedShow.color}20`,borderRadius:4,padding:"2px 7px",flexShrink:0 }}>UP NEXT</span>}
+                                  <span style={{ fontSize:13,flex:1,color:watched?"#3a3a5a":epAired?"#c8c8e0":"#5a5a7a",textDecoration:watched?"line-through":"none",textDecorationColor:"#2a2a4a" }}>{ep.title}</span>
+                                  {!epAired && ep.aired && <span style={{ fontSize:10,color:"#4a4a6a",flexShrink:0 }}>{new Date(ep.aired).toLocaleDateString("en-US",{month:"short",day:"numeric"})}</span>}
+                                  {!epAired && <span style={{ fontSize:10,fontWeight:600,letterSpacing:"0.5px",color:"#4a4a6a",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:4,padding:"2px 7px",flexShrink:0 }}>Unaired</span>}
+                                  {isNext && epAired && <span style={{ fontSize:10,fontWeight:700,letterSpacing:"0.8px",color:selectedShow.color,background:`${selectedShow.color}20`,borderRadius:4,padding:"2px 7px",flexShrink:0 }}>UP NEXT</span>}
                                 </div>
                               );
                             })}
