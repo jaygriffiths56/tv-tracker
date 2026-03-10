@@ -128,7 +128,13 @@ async function fetchShowData(title) {
   const airDayFormatted = airDay.charAt(0).toUpperCase() + airDay.slice(1);
 
   const genre = series.genres?.[0]?.name ?? match.genres?.[0] ?? "Drama";
-  const poster = series.image ?? match.image_url ?? null;
+
+  // TVDB returns relative paths like /banners/... — prepend base URL
+  const TVDB_IMG = "https://artworks.thetvdb.com";
+  const rawPoster = series.image ?? match.image_url ?? null;
+  const poster = rawPoster
+    ? rawPoster.startsWith("http") ? rawPoster : `${TVDB_IMG}${rawPoster}`
+    : null;
 
   return {
     tvdb_id: String(seriesId),
@@ -213,7 +219,7 @@ function AuthScreen({ onAuth }) {
     <div style={{ minHeight:"100vh", background:"#0c0c14", display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'DM Sans','Segoe UI',sans-serif" }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Serif+Display&display=swap'); @keyframes dot-pulse{0%,100%{opacity:.3;transform:scale(.7)}50%{opacity:1;transform:scale(1)}} *{box-sizing:border-box;margin:0;padding:0} input:focus{outline:none;border-color:#6060c0!important} button{cursor:pointer;font-family:inherit}`}</style>
       <div style={{ width:"100%", maxWidth:400, padding:"0 24px" }}>
-        <h1 style={{ fontFamily:"'DM Serif Display',serif", fontSize:32, color:"#fff", textAlign:"center", marginBottom:8 }}>TV Guide</h1>
+        <h1 style={{ fontFamily:"'DM Serif Display',serif", fontSize:32, color:"#fff", textAlign:"center", marginBottom:8 }}>TV Show Tracker</h1>
         <p style={{ color:"#3a3a5a", fontSize:13, textAlign:"center", marginBottom:36 }}>Track your shows across every device</p>
         <div style={{ background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:14, padding:"28px 24px" }}>
           <div style={{ display:"flex", marginBottom:24, background:"rgba(255,255,255,0.04)", borderRadius:8, padding:3 }}>
@@ -442,34 +448,50 @@ export default function TVTracker() {
   }, [selectedShow?.id]);
 
   async function loadWatchingTogether(show) {
-    const { data: otherShows } = await supabase.from("shows").select("id, user_id").eq("tvdb_id", show.tvdb_id).neq("user_id", session.user.id);
-    if (!otherShows?.length) { setWatchingTogether([]); return; }
-    const { data: myFollows } = await supabase.from("show_followers").select("follower_id, following_id").or(`follower_id.eq.${session.user.id},following_id.eq.${session.user.id}`);
+    // Find all shows with the same tvdb_id (including current user's own row)
+    const { data: allMatchingShows } = await supabase
+      .from("shows").select("id, user_id").eq("tvdb_id", show.tvdb_id);
+    if (!allMatchingShows?.length) { setWatchingTogether([]); return; }
+
+    // Get all connected user IDs (people I follow or who follow me)
+    const { data: myFollows } = await supabase
+      .from("show_followers").select("follower_id, following_id")
+      .or(`follower_id.eq.${session.user.id},following_id.eq.${session.user.id}`);
     const connectedIds = new Set();
     (myFollows || []).forEach(f => {
       if (f.follower_id === session.user.id) connectedIds.add(f.following_id);
       if (f.following_id === session.user.id) connectedIds.add(f.follower_id);
     });
-    const relevantShows = otherShows.filter(s => connectedIds.has(s.user_id));
-    if (!relevantShows.length) { setWatchingTogether([]); return; }
-    const relevantIds = relevantShows.map(s => s.user_id);
-    const relevantShowIds = relevantShows.map(s => s.id);
-    const { data: profiles } = await supabase.from("profiles").select("*").in("id", relevantIds);
+
+    // Only show connected users (not the current user themselves)
+    const allConnectedIds = [...connectedIds];
+    if (!allConnectedIds.length) { setWatchingTogether([]); return; }
+
+    // Get profiles for display names
+    const { data: profiles } = await supabase.from("profiles").select("*").in("id", allConnectedIds);
     const profileMap = {};
     (profiles || []).forEach(p => { profileMap[p.id] = p; });
-    const { data: theirWatched } = await supabase.from("watched_episodes").select("*").in("show_id", relevantShowIds);
+
+    // Fetch all watched episodes for connected users — they may be stored against
+    // any show_id for this tvdb_id (e.g. User B tracks progress against User A's show row)
+    // so we only filter by user_id, not show_id
+    const allTvdbShowIds = allMatchingShows.map(s => s.id);
+    const { data: theirWatched } = await supabase
+      .from("watched_episodes").select("*")
+      .in("user_id", allConnectedIds)
+      .in("show_id", allTvdbShowIds);
+
     const watchedByUser = {};
     for (const row of (theirWatched || [])) {
-      const userId = relevantShows.find(s => s.id === row.show_id)?.user_id;
-      if (!userId) continue;
-      if (!watchedByUser[userId]) watchedByUser[userId] = {};
-      watchedByUser[userId][epKey(row.season_num, row.ep_num)] = true;
+      if (!watchedByUser[row.user_id]) watchedByUser[row.user_id] = {};
+      watchedByUser[row.user_id][epKey(row.season_num, row.ep_num)] = true;
     }
-    setWatchingTogether(relevantShows.map(s => ({
-      userId: s.user_id,
-      displayName: profileMap[s.user_id]?.display_name || "Unknown",
-      watched: watchedByUser[s.user_id] || {},
-    })));
+
+    setWatchingTogether(allConnectedIds.map(userId => ({
+      userId,
+      displayName: profileMap[userId]?.display_name || "Unknown",
+      watched: watchedByUser[userId] || {},
+    })).filter(u => Object.keys(u.watched).length > 0 || true)); // show all connected users
   }
 
   async function toggleEpisode(showId, seasonNum, epNum) {
@@ -596,7 +618,7 @@ export default function TVTracker() {
         <div style={{ maxWidth:1100, margin:"0 auto" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:2 }}>
             <div style={{ display:"flex", alignItems:"baseline", gap:12 }}>
-              <h1 style={{ fontFamily:"'DM Serif Display',serif", fontSize:28, fontWeight:400, color:"#fff", letterSpacing:"-0.5px" }}>TV Guide</h1>
+              <h1 style={{ fontFamily:"'DM Serif Display',serif", fontSize:28, fontWeight:400, color:"#fff", letterSpacing:"-0.5px" }}>TV Show Tracker</h1>
               <span style={{ color:"#3a3a5a", fontSize:12 }}>{shows.length} show{shows.length!==1?"s":""} tracked</span>
             </div>
             <div style={{ display:"flex", alignItems:"center", gap:12 }}>
